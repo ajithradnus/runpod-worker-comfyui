@@ -11,13 +11,11 @@ import runpod
 from runpod.serverless.utils.rp_validator import validate
 from runpod.serverless.modules.rp_logger import RunPodLogger
 from requests.adapters import HTTPAdapter, Retry
-from schemas.input import INPUT_SCHEMA
-
 
 BASE_URI = 'http://127.0.0.1:3000'
 VOLUME_MOUNT_PATH = '/runpod-volume'
-LOG_FILE= 'comfyui-worker.log'
-TIMEOUT = 600
+LOG_FILE = 'comfyui-worker.log'
+TIMEOUT = 200  # Timeout for API calls in seconds
 LOG_LEVEL = 'INFO'
 
 session = requests.Session()
@@ -25,43 +23,45 @@ retries = Retry(total=10, backoff_factor=0.1, status_forcelist=[502, 503, 504])
 session.mount('http://', HTTPAdapter(max_retries=retries))
 rp_logger = RunPodLogger()
 
-
-# ---------------------------------------------------------------------------- #
-#                               ComfyUI Functions                              #
-# ---------------------------------------------------------------------------- #
-
+# Function to wait for ComfyUI service to be ready
 def wait_for_service(url):
     retries = 0
-
     while True:
         try:
             requests.get(url)
             return
         except requests.exceptions.RequestException:
             retries += 1
-
-            # Only log every 15 retries so the logs don't get spammed
             if retries % 15 == 0:
                 rp_logger.info('Service not ready yet. Retrying...')
         except Exception as err:
             rp_logger.error(f'Error: {err}')
-
         time.sleep(0.2)
 
-
+# Send GET request with timeout
 def send_get_request(endpoint):
     return session.get(
         url=f'{BASE_URI}/{endpoint}',
         timeout=TIMEOUT
     )
 
-
+# Send POST request with timeout
 def send_post_request(endpoint, payload):
     return session.post(
         url=f'{BASE_URI}/{endpoint}',
         json=payload,
         timeout=TIMEOUT
     )
+
+# Helper functions for constructing the payload
+def get_workflow_payload(workflow_name, payload):
+    with open(f'/workflows/{workflow_name}.json', 'r') as json_file:
+        workflow = json.load(json_file)
+
+    if workflow_name == 'txt2img':
+        workflow = get_txt2img_payload(workflow, payload)
+
+    return workflow
 
 def get_txt2img_payload(workflow, payload):
     workflow["3"]["inputs"]["seed"] = payload["seed"]
@@ -76,66 +76,9 @@ def get_txt2img_payload(workflow, payload):
     workflow["7"]["inputs"]["text"] = payload["negative_prompt"]
     return workflow
 
-
-def get_img2img_payload(workflow, payload):
-    workflow["13"]["inputs"]["seed"] = payload["seed"]
-    workflow["13"]["inputs"]["steps"] = payload["steps"]
-    workflow["13"]["inputs"]["cfg"] = payload["cfg_scale"]
-    workflow["13"]["inputs"]["sampler_name"] = payload["sampler_name"]
-    workflow["13"]["inputs"]["scheduler"] = payload["scheduler"]
-    workflow["13"]["inputs"]["denoise"] = payload["denoise"]
-    workflow["1"]["inputs"]["ckpt_name"] = payload["ckpt_name"]
-    workflow["2"]["inputs"]["width"] = payload["width"]
-    workflow["2"]["inputs"]["height"] = payload["height"]
-    workflow["2"]["inputs"]["target_width"] = payload["width"]
-    workflow["2"]["inputs"]["target_height"] = payload["height"]
-    workflow["4"]["inputs"]["width"] = payload["width"]
-    workflow["4"]["inputs"]["height"] = payload["height"]
-    workflow["4"]["inputs"]["target_width"] = payload["width"]
-    workflow["4"]["inputs"]["target_height"] = payload["height"]
-    workflow["6"]["inputs"]["text"] = payload["prompt"]
-    workflow["7"]["inputs"]["text"] = payload["negative_prompt"]
-    return workflow
-
-
-def get_workflow_payload(workflow_name, payload):
-    with open(f'/workflows/{workflow_name}.json', 'r') as json_file:
-        workflow = json.load(json_file)
-
-    if workflow_name == 'txt2img':
-        workflow = get_txt2img_payload(workflow, payload)
-
-    return workflow
-
-
-"""
-Get the filenames of the output images
-"""
-def get_filenames(output):
-    for key, value in output.items():
-        if 'images' in value and isinstance(value['images'], list):
-            return value['images']
-
-
-"""
-Create a unique filename prefix for each request to avoid a race condition where
-more than one request completes at the same time, which can either result in the
-incorrect output being returned, or the output image not being found.
-"""
-def create_unique_filename_prefix(payload):
-    for key, value in payload.items():
-        class_type = value.get('class_type')
-
-        if class_type == 'SaveImage':
-            payload[key]['inputs']['filename_prefix'] = str(uuid.uuid4())
-
-
-# ---------------------------------------------------------------------------- #
-#                                RunPod Handler                                #
-# ---------------------------------------------------------------------------- #
+# Main handler function
 def handler(event):
     job_id = event['id']
-
     try:
         validated_input = validate(event['input'], INPUT_SCHEMA)
 
@@ -160,7 +103,6 @@ def handler(event):
                 rp_logger.error(f'Unable to load workflow payload for: {workflow_name}', job_id)
                 raise
 
-        create_unique_filename_prefix(payload)
         rp_logger.debug('Queuing prompt', job_id)
 
         queue_response = send_post_request(
@@ -174,12 +116,16 @@ def handler(event):
             resp_json = queue_response.json()
             prompt_id = resp_json['prompt_id']
             rp_logger.info(f'Prompt queued successfully: {prompt_id}', job_id)
-            retries = 0
 
+            # Polling for result with timeout
+            start_time = time.time()
             while True:
-                # Only log every 15 retries so the logs don't get spammed
-                if retries == 0 or retries % 15 == 0:
-                    rp_logger.info(f'Getting status of prompt: {prompt_id}', job_id)
+                elapsed_time = time.time() - start_time
+                if elapsed_time > TIMEOUT:
+                    rp_logger.error(f'Timeout reached for prompt ID: {prompt_id}', job_id)
+                    return {
+                        'error': 'Request timed out after 200 seconds.'
+                    }
 
                 r = send_get_request(f'history/{prompt_id}')
                 resp_json = r.json()
@@ -188,26 +134,25 @@ def handler(event):
                     break
 
                 time.sleep(0.2)
-                retries += 1
 
             status = resp_json[prompt_id]['status']
 
             if status['status_str'] == 'success' and status['completed']:
                 # Job was processed successfully
                 outputs = resp_json[prompt_id]['outputs']
-
-                if len(outputs):
+                if outputs:
                     rp_logger.info(f'Images generated successfully for prompt: {prompt_id}', job_id)
-                    image_filenames = get_filenames(outputs)
-                    images = []
 
-                    for image_filename in image_filenames:
-                        filename = image_filename['filename']
+                    # Convert images to base64
+                    images = []
+                    for output in outputs:
+                        filename = output['images'][0]['filename']
                         image_path = f'{VOLUME_MOUNT_PATH}/ComfyUI/output/{filename}'
 
                         with open(image_path, 'rb') as image_file:
                             images.append(base64.b64encode(image_file.read()).decode('utf-8'))
 
+                        # Delete the output image to save space
                         rp_logger.info(f'Deleting output file: {image_path}', job_id)
                         os.remove(image_path)
 
@@ -217,18 +162,15 @@ def handler(event):
                 else:
                     raise RuntimeError(f'No output found for prompt id: {prompt_id}')
             else:
-                # Job did not process successfully
+                # Handle errors from the job
                 for message in status['messages']:
                     key, value = message
-
                     if key == 'execution_error':
                         if 'node_type' in value and 'exception_message' in value:
                             node_type = value['node_type']
                             exception_message = value['exception_message']
                             raise RuntimeError(f'{node_type}: {exception_message}')
                         else:
-                            # Log to file instead of RunPod because the output tends to be too verbose
-                            # and gets dropped by RunPod logging
                             error_msg = f'Job did not process successfully for prompt_id: {prompt_id}'
                             logging.error(error_msg)
                             logging.info(f'{job_id}: Response JSON: {resp_json}')
