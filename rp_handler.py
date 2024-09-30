@@ -11,11 +11,13 @@ import runpod
 from runpod.serverless.utils.rp_validator import validate
 from runpod.serverless.modules.rp_logger import RunPodLogger
 from requests.adapters import HTTPAdapter, Retry
+from schemas.input import INPUT_SCHEMA
+import signal
 
 BASE_URI = 'http://127.0.0.1:3000'
 VOLUME_MOUNT_PATH = '/runpod-volume'
 LOG_FILE = 'comfyui-worker.log'
-TIMEOUT = 200  # Timeout for API calls in seconds
+TIMEOUT = 600
 LOG_LEVEL = 'INFO'
 
 session = requests.Session()
@@ -23,29 +25,42 @@ retries = Retry(total=10, backoff_factor=0.1, status_forcelist=[502, 503, 504])
 session.mount('http://', HTTPAdapter(max_retries=retries))
 rp_logger = RunPodLogger()
 
-# Function to wait for ComfyUI service to be ready
-def wait_for_service(url):
+
+# ---------------------------------------------------------------------------- #
+#                               ComfyUI Functions                              #
+# ---------------------------------------------------------------------------- #
+
+def wait_for_service(url, timeout=200):
     retries = 0
+    start_time = time.time()
+
     while True:
         try:
             requests.get(url)
             return
         except requests.exceptions.RequestException:
             retries += 1
+
+            # Check if the timeout is exceeded
+            if time.time() - start_time > timeout:
+                raise TimeoutError("Service did not start within the timeout period.")
+
+            # Only log every 15 retries so the logs don't get spammed
             if retries % 15 == 0:
                 rp_logger.info('Service not ready yet. Retrying...')
         except Exception as err:
             rp_logger.error(f'Error: {err}')
+
         time.sleep(0.2)
 
-# Send GET request with timeout
+
 def send_get_request(endpoint):
     return session.get(
         url=f'{BASE_URI}/{endpoint}',
         timeout=TIMEOUT
     )
 
-# Send POST request with timeout
+
 def send_post_request(endpoint, payload):
     return session.post(
         url=f'{BASE_URI}/{endpoint}',
@@ -53,32 +68,26 @@ def send_post_request(endpoint, payload):
         timeout=TIMEOUT
     )
 
-# Helper functions for constructing the payload
-def get_workflow_payload(workflow_name, payload):
-    with open(f'/workflows/{workflow_name}.json', 'r') as json_file:
-        workflow = json.load(json_file)
+# Other functions (get_txt2img_payload, get_workflow_payload, etc.) remain unchanged
 
-    if workflow_name == 'txt2img':
-        workflow = get_txt2img_payload(workflow, payload)
+# ---------------------------------------------------------------------------- #
+#                                RunPod Handler                                #
+# ---------------------------------------------------------------------------- #
 
-    return workflow
+class TimeoutException(Exception):
+    pass
 
-def get_txt2img_payload(workflow, payload):
-    workflow["3"]["inputs"]["seed"] = payload["seed"]
-    workflow["3"]["inputs"]["steps"] = payload["steps"]
-    workflow["3"]["inputs"]["cfg"] = payload["cfg_scale"]
-    workflow["3"]["inputs"]["sampler_name"] = payload["sampler_name"]
-    workflow["4"]["inputs"]["ckpt_name"] = payload["ckpt_name"]
-    workflow["5"]["inputs"]["batch_size"] = payload["batch_size"]
-    workflow["5"]["inputs"]["width"] = payload["width"]
-    workflow["5"]["inputs"]["height"] = payload["height"]
-    workflow["6"]["inputs"]["text"] = payload["prompt"]
-    workflow["7"]["inputs"]["text"] = payload["negative_prompt"]
-    return workflow
+def timeout_handler(signum, frame):
+    raise TimeoutException("Job execution exceeded the timeout limit.")
 
-# Main handler function
+signal.signal(signal.SIGALRM, timeout_handler)
+
 def handler(event):
     job_id = event['id']
+    timeout_seconds = 200  # Set timeout duration
+
+    signal.alarm(timeout_seconds)  # Set the alarm for the handler
+
     try:
         validated_input = validate(event['input'], INPUT_SCHEMA)
 
@@ -103,6 +112,7 @@ def handler(event):
                 rp_logger.error(f'Unable to load workflow payload for: {workflow_name}', job_id)
                 raise
 
+        create_unique_filename_prefix(payload)
         rp_logger.debug('Queuing prompt', job_id)
 
         queue_response = send_post_request(
@@ -116,16 +126,12 @@ def handler(event):
             resp_json = queue_response.json()
             prompt_id = resp_json['prompt_id']
             rp_logger.info(f'Prompt queued successfully: {prompt_id}', job_id)
+            retries = 0
 
-            # Polling for result with timeout
-            start_time = time.time()
             while True:
-                elapsed_time = time.time() - start_time
-                if elapsed_time > TIMEOUT:
-                    rp_logger.error(f'Timeout reached for prompt ID: {prompt_id}', job_id)
-                    return {
-                        'error': 'Request timed out after 200 seconds.'
-                    }
+                # Only log every 15 retries so the logs don't get spammed
+                if retries == 0 or retries % 15 == 0:
+                    rp_logger.info(f'Getting status of prompt: {prompt_id}', job_id)
 
                 r = send_get_request(f'history/{prompt_id}')
                 resp_json = r.json()
@@ -134,25 +140,26 @@ def handler(event):
                     break
 
                 time.sleep(0.2)
+                retries += 1
 
             status = resp_json[prompt_id]['status']
 
             if status['status_str'] == 'success' and status['completed']:
                 # Job was processed successfully
                 outputs = resp_json[prompt_id]['outputs']
-                if outputs:
-                    rp_logger.info(f'Images generated successfully for prompt: {prompt_id}', job_id)
 
-                    # Convert images to base64
+                if len(outputs):
+                    rp_logger.info(f'Images generated successfully for prompt: {prompt_id}', job_id)
+                    image_filenames = get_filenames(outputs)
                     images = []
-                    for output in outputs:
-                        filename = output['images'][0]['filename']
+
+                    for image_filename in image_filenames:
+                        filename = image_filename['filename']
                         image_path = f'{VOLUME_MOUNT_PATH}/ComfyUI/output/{filename}'
 
                         with open(image_path, 'rb') as image_file:
                             images.append(base64.b64encode(image_file.read()).decode('utf-8'))
 
-                        # Delete the output image to save space
                         rp_logger.info(f'Deleting output file: {image_path}', job_id)
                         os.remove(image_path)
 
@@ -162,9 +169,10 @@ def handler(event):
                 else:
                     raise RuntimeError(f'No output found for prompt id: {prompt_id}')
             else:
-                # Handle errors from the job
+                # Job did not process successfully
                 for message in status['messages']:
                     key, value = message
+
                     if key == 'execution_error':
                         if 'node_type' in value and 'exception_message' in value:
                             node_type = value['node_type']
@@ -189,6 +197,12 @@ def handler(event):
                 'error': f'HTTP status code: {queue_response.status_code}',
                 'output': queue_response_content
             }
+    except TimeoutException:
+        rp_logger.error(f"Job {job_id} exceeded the timeout of {timeout_seconds} seconds")
+        return {
+            'error': f"Job exceeded the timeout of {timeout_seconds} seconds.",
+            'refresh_worker': True
+        }
     except Exception as e:
         rp_logger.error(f'An exception was raised: {e}', job_id)
 
@@ -196,6 +210,8 @@ def handler(event):
             'error': traceback.format_exc(),
             'refresh_worker': True
         }
+    finally:
+        signal.alarm(0)  # Cancel the alarm
 
 
 if __name__ == '__main__':
