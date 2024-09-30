@@ -25,7 +25,6 @@ retries = Retry(total=10, backoff_factor=0.1, status_forcelist=[502, 503, 504])
 session.mount('http://', HTTPAdapter(max_retries=retries))
 rp_logger = RunPodLogger()
 
-
 # ---------------------------------------------------------------------------- #
 #                               ComfyUI Functions                              #
 # ---------------------------------------------------------------------------- #
@@ -75,7 +74,45 @@ def create_unique_filename_prefix(payload):
     payload['prompt']['filename_prefix'] = unique_prefix
 
 
-# Other functions (get_txt2img_payload, get_workflow_payload, etc.) remain unchanged
+def get_workflow_payload(workflow_name, payload):
+    """Generate workflow payload based on workflow_name and input payload."""
+    if workflow_name == 'txt2img':
+        return get_txt2img_payload(payload)
+    elif workflow_name == 'img2img':
+        return get_img2img_payload(payload)
+    # Add more workflows as needed
+    else:
+        raise ValueError(f"Unsupported workflow: {workflow_name}")
+
+
+def get_txt2img_payload(payload):
+    """Generate payload for txt2img workflow."""
+    return {
+        'prompt': {
+            'prompt_text': payload.get('prompt_text', ''),
+            'steps': payload.get('steps', 20),
+            'sampler_name': payload.get('sampler_name', 'Euler a'),
+            'width': payload.get('width', 512),
+            'height': payload.get('height', 512),
+            # Add more default parameters as needed
+        }
+    }
+
+
+def get_img2img_payload(payload):
+    """Generate payload for img2img workflow."""
+    return {
+        'prompt': {
+            'prompt_text': payload.get('prompt_text', ''),
+            'init_image': payload.get('init_image', ''),
+            'strength': payload.get('strength', 0.75),
+            'steps': payload.get('steps', 20),
+            'sampler_name': payload.get('sampler_name', 'Euler a'),
+            'width': payload.get('width', 512),
+            'height': payload.get('height', 512),
+            # Add more default parameters as needed
+        }
+    }
 
 # ---------------------------------------------------------------------------- #
 #                                RunPod Handler                                #
