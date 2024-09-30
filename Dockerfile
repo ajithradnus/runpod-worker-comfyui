@@ -1,11 +1,15 @@
+# Use the base image with CUDA support
 FROM nvidia/cuda:11.8.0-cudnn8-devel-ubuntu22.04
 
+# Set environment variables
 ENV DEBIAN_FRONTEND=noninteractive \
     PIP_PREFER_BINARY=1 \
     PYTHONUNBUFFERED=1
 
+# Use bash shell for RUN commands
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
+# Set working directory
 WORKDIR /
 
 # Upgrade apt packages and install required dependencies
@@ -35,21 +39,20 @@ RUN apt update && \
     rm -rf /var/lib/apt/lists/* && \
     apt-get clean -y
 
-# Set Python
+# Set Python alternative
 RUN ln -s /usr/bin/python3.10 /usr/bin/python
 
-# Install Worker dependencies
-RUN pip install requests runpod
+# Install Python dependencies
+COPY requirements.txt ./
+RUN pip install --no-cache-dir -r requirements.txt
 
-# Add RunPod Handler and Docker container start script
+# Copy necessary files into the image
 COPY start.sh rp_handler.py ./
-
-# Add validation schemas
 COPY schemas /schemas
-
-# Add workflows
 COPY workflows /workflows
 
-# Start the container
+# Make the start script executable
 RUN chmod +x /start.sh
-ENTRYPOINT /start.sh
+
+# Define the command to run the container
+ENTRYPOINT ["/start.sh"]
