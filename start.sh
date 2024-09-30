@@ -2,16 +2,20 @@
 
 echo "Worker Initiated"
 
+# Create a symlink to the workspace
 echo "Symlinking files from Network Volume"
-rm -rf /workspace && \
-  ln -s /runpod-volume /workspace
+rm -rf /workspace
+ln -s /runpod-volume /workspace
 
 echo "Starting ComfyUI API"
 source /workspace/venv/bin/activate
+
+# Load TCMALLOC for performance optimization
 TCMALLOC="$(ldconfig -p | grep -Po "libtcmalloc.so.\d" | head -n 1)"
 export LD_PRELOAD="${TCMALLOC}"
 export PYTHONUNBUFFERED=true
 export HF_HOME="/workspace"
+
 cd /workspace/ComfyUI
 python main.py --port 3000 > /workspace/logs/comfyui.log 2>&1 &
 deactivate
