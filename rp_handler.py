@@ -68,6 +68,13 @@ def send_post_request(endpoint, payload):
         timeout=TIMEOUT
     )
 
+
+def create_unique_filename_prefix(payload):
+    """Generate a unique filename prefix for the payload."""
+    unique_prefix = str(uuid.uuid4())
+    payload['prompt']['filename_prefix'] = unique_prefix
+
+
 # Other functions (get_txt2img_payload, get_workflow_payload, etc.) remain unchanged
 
 # ---------------------------------------------------------------------------- #
